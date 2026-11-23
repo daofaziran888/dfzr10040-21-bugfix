@@ -198,6 +198,9 @@ class SnapshotPartition:
     status_mark: str
     dependency_partitions: list[str]
     created_time: str
+    # 实际交付的分区数据：列定义与记录行，是导出投影与交叉校验的真源
+    columns: list[str] = field(default_factory=list)
+    rows: list[dict[str, Any]] = field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -350,3 +353,26 @@ class FusionMonitorMetric:
     alert_channel: str
     silence_window: str
     last_sample: str = ""
+
+
+@dataclass
+class ProjectionAudit:
+    """投影核对明细：一次导出在单个分区上的字段命中核对与复核状态。
+
+    按分区实际列定义判断空投影：字段全部命中且分区零行才是有效空明细；
+    字段未命中的分区记录字段缺失，不能算已核过的零行。
+    """
+    audit_id: int
+    plan_code: str
+    snapshot_id: int
+    partition_code: str
+    partition_range: str
+    requested_fields: list[str]
+    actual_columns: list[str]
+    hit_fields: list[str]
+    missing_fields: list[str]
+    row_count: int
+    status: str                    # 已出数 / 零行 / 字段缺失
+    review_status: str = "待复核"   # 待复核 / 预核 / 已复核
+    settlement_group: str = ""     # 所属结算核对（联合请求）
+    compared: bool = False         # 本次交叉校验是否已覆盖该日期

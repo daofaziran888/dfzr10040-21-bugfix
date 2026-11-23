@@ -22,6 +22,7 @@ from app.models import (
     MergeConflictRule,
     MetricAggrRule,
     PartitionRule,
+    ProjectionAudit,
     QualityGateRule,
     SchemaMapping,
     SnapshotPartition,
@@ -37,6 +38,15 @@ def _now_iso() -> str:
 
 def _generate_code(prefix: str, index: int) -> str:
     return f"{prefix}-{index:04d}"
+
+
+def _numeric_difference(primary: Any, reference: Any) -> int | float | None:
+    """计算数值差额（主体 - 参照）；非数值返回 None。"""
+    try:
+        diff = float(primary) - float(reference)
+    except (TypeError, ValueError):
+        return None
+    return int(diff) if diff == int(diff) else diff
 
 
 class FusionEngine:
@@ -60,6 +70,8 @@ class FusionEngine:
         self._cross_validates: dict[int, CrossValidatePlan] = {}
         self._drifts: dict[int, DataDriftRecord] = {}
         self._monitors: dict[int, FusionMonitorMetric] = {}
+        self._projection_audits: dict[int, ProjectionAudit] = {}
+        self._settlement_groups: dict[str, dict[str, Any]] = {}
         self._next_id: int = 1
 
     def _next_seq(self) -> int:
@@ -161,18 +173,22 @@ class FusionEngine:
 
     def create_snapshot(self, target_wide_table: str, partition_key_value: str,
                         dependency_partitions: list[str] | None = None,
-                        schema_digest: str = "") -> SnapshotPartition:
+                        schema_digest: str = "",
+                        columns: list[str] | None = None,
+                        rows: list[dict[str, Any]] | None = None) -> SnapshotPartition:
         sid = self._next_seq()
         snap = SnapshotPartition(
             partition_id=sid,
             partition_code=_generate_code("SNAP", sid),
             target_wide_table=target_wide_table,
             partition_key_value=partition_key_value,
-            record_count=0,
+            record_count=len(rows) if rows else 0,
             schema_digest=schema_digest or f"SHA256-{uuid.uuid4().hex[:8]}",
             status_mark="创建中",
             dependency_partitions=dependency_partitions or [],
             created_time=_now_iso(),
+            columns=list(columns or []),
+            rows=[dict(row) for row in (rows or [])],
         )
         self._snapshots[sid] = snap
         return snap
@@ -540,8 +556,14 @@ class FusionEngine:
         }
 
     def execute_export_from_snapshot(self, export_id: int,
-                                     snapshot_id: int) -> dict[str, Any]:
-        """从分区快照执行数据导出。"""
+                                     snapshot_id: int,
+                                     settlement_group: str = "") -> dict[str, Any]:
+        """从分区快照执行数据导出，并按分区实际列定义输出投影核对明细。
+
+        空投影判断：只有分区确实零行且所选字段全部命中时才算有效空明细
+        （带真实列名和分区范围）；字段未命中的分区记录字段缺失，
+        不再返回一串空对象冒充已完成。
+        """
         plan = self._exports.get(export_id)
         snap = self._snapshots.get(snapshot_id)
         if plan is None:
@@ -549,29 +571,430 @@ class FusionEngine:
         if snap is None:
             return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
 
-        fusion_job = self._find_fusion_job_by_table(snap.target_wide_table)
-        records = fusion_job.merged_records if fusion_job else []
+        records = self._partition_records(snap)
+        actual_columns = self._partition_columns(snap, records)
 
-        if plan.field_filter:
-            records = [
-                {k: v for k, v in rec.items() if k in plan.field_filter}
+        requested = list(plan.field_filter)
+        if requested:
+            hit = [f for f in requested if f in actual_columns]
+            missing = [f for f in requested if f not in actual_columns]
+        else:
+            hit, missing = [], []
+
+        if requested:
+            # 只投影命中列；全部未命中时不出空对象
+            projected = [
+                {k: v for k, v in rec.items() if k in hit}
                 for rec in records
-            ]
+            ] if hit else []
+        else:
+            projected = [dict(rec) for rec in records]
 
-        if plan.row_limit > 0 and len(records) > plan.row_limit:
-            records = records[:plan.row_limit]
+        if plan.row_limit > 0 and len(projected) > plan.row_limit:
+            projected = projected[:plan.row_limit]
 
-        plan.export_status = "已完成"
+        if missing:
+            projection_status = "字段缺失"
+        elif not projected:
+            projection_status = "零行"
+        else:
+            projection_status = "已出数"
+
+        plan.export_status = "字段缺失" if missing else "已完成"
+
+        header = hit if requested else actual_columns
+
+        if settlement_group:
+            self._drop_stale_audits(settlement_group, snap.partition_key_value)
+        audit = ProjectionAudit(
+            audit_id=self._next_seq(),
+            plan_code=plan.plan_code,
+            snapshot_id=snap.partition_id,
+            partition_code=snap.partition_code,
+            partition_range=snap.partition_key_value,
+            requested_fields=requested,
+            actual_columns=actual_columns,
+            hit_fields=hit,
+            missing_fields=missing,
+            row_count=len(projected),
+            status=projection_status,
+            settlement_group=settlement_group,
+        )
+        self._projection_audits[audit.audit_id] = audit
+        if settlement_group:
+            self._ensure_settlement_todo(settlement_group, snap.partition_key_value)
 
         return {
             "ok": True,
             "plan_code": plan.plan_code,
             "snapshot_code": snap.partition_code,
-            "exported_rows": len(records),
+            "exported_rows": len(projected),
             "format": plan.export_format,
             "path": plan.export_path,
-            "records": records,
+            "records": projected,
+            "projection": {
+                "audit_id": audit.audit_id,
+                "partition_range": snap.partition_key_value,
+                "requested_fields": requested,
+                "actual_columns": actual_columns,
+                "hit_fields": hit,
+                "missing_fields": missing,
+                "header": header,
+                "status": projection_status,
+            },
         }
+
+    def retry_export_from_snapshot(self, export_id: int, snapshot_id: int,
+                                   settlement_group: str = "") -> dict[str, Any]:
+        """中断后重试：沿用计划登记的原选择（字段筛选），不更换字段集合。"""
+        plan = self._exports.get(export_id)
+        if plan is None:
+            return {"ok": False, "message": f"导出计划 {export_id} 不存在"}
+        result = self.execute_export_from_snapshot(
+            export_id, snapshot_id, settlement_group=settlement_group,
+        )
+        if result.get("ok"):
+            result["retried"] = True
+            result["selection"] = list(plan.field_filter)
+        return result
+
+    # ---- 结算核对：联合导出 -> 交付分区交叉校验 -> 补采待办 -> 入账 ----
+
+    def deliver_partition_data(self, snapshot_id: int, columns: list[str],
+                               rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """交付分区实际数据：列定义与记录行，作为导出投影与交叉校验的真源。"""
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
+        snap.columns = list(columns)
+        snap.rows = [dict(row) for row in rows]
+        snap.record_count = len(rows)
+        return {
+            "ok": True,
+            "partition_code": snap.partition_code,
+            "columns": list(snap.columns),
+            "record_count": snap.record_count,
+        }
+
+    def execute_settlement_export(self, export_id: int, snapshot_ids: list[int],
+                                  settlement_group: str = "") -> dict[str, Any]:
+        """联合导出：先分别请求各分区，再合起来出数并立即复核。
+
+        同一次结算核对的多个日期共用一个导出计划（原选择），每个分区
+        单独出投影核对明细；合并出数只汇总本次字段命中的分区，
+        复核详情按分区实际列定义给出，字段缺失不显示为已完成。
+        """
+        plan = self._exports.get(export_id)
+        if plan is None:
+            return {"ok": False, "message": f"导出计划 {export_id} 不存在"}
+        group = settlement_group or f"SETTLE-{export_id:04d}"
+
+        # 第一阶段：分别请求各分区，按分区实际列定义出投影核对明细
+        per_partition: list[dict[str, Any]] = []
+        for snapshot_id in snapshot_ids:
+            per_partition.append(
+                self.execute_export_from_snapshot(
+                    export_id, snapshot_id, settlement_group=group,
+                )
+            )
+
+        # 第二阶段：合起来出数并立即复核
+        combined_records: list[dict[str, Any]] = []
+        combined_columns: list[str] = []
+        review_details: list[dict[str, Any]] = []
+        for result in per_partition:
+            if not result.get("ok"):
+                review_details.append({"ok": False, "message": result.get("message", "")})
+                continue
+            projection = result["projection"]
+            audit = self._projection_audits[projection["audit_id"]]
+            if not projection["missing_fields"]:
+                for field_name in projection["header"]:
+                    if field_name not in combined_columns:
+                        combined_columns.append(field_name)
+                combined_records.extend(result["records"])
+            review_details.append({
+                "ok": True,
+                "snapshot_code": result["snapshot_code"],
+                "partition_range": projection["partition_range"],
+                "projection_status": projection["status"],
+                "actual_columns": projection["actual_columns"],
+                "hit_fields": projection["hit_fields"],
+                "missing_fields": projection["missing_fields"],
+                "row_count": result["exported_rows"],
+                "review_status": audit.review_status,
+            })
+
+        return {
+            "ok": True,
+            "plan_code": plan.plan_code,
+            "settlement_group": group,
+            "selection": list(plan.field_filter),
+            "combined_rows": len(combined_records),
+            "combined_columns": combined_columns,
+            "records": combined_records,
+            "review_details": review_details,
+        }
+
+    def confirm_partition_field_source(self, snapshot_id: int, field: str,
+                                       source_field: str) -> dict[str, Any]:
+        """为分区核定字段来源：从已有列派生目标列（如 amount 来源于 gross）。"""
+        snap = self._snapshots.get(snapshot_id)
+        if snap is None:
+            return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
+        if source_field not in snap.columns:
+            return {"ok": False,
+                    "message": f"分区 {snap.partition_code} 无来源列 {source_field}"}
+        for row in snap.rows:
+            row[field] = row.get(source_field)
+        if field not in snap.columns:
+            snap.columns.append(field)
+        return {
+            "ok": True,
+            "partition_code": snap.partition_code,
+            "field": field,
+            "source_field": source_field,
+        }
+
+    def execute_delivered_cross_validation(self, plan_id: int,
+                                           settlement_group: str) -> dict[str, Any]:
+        """用实际交付的分区做宽表交叉校验。
+
+        读取投影核对明细：只把本次有资格（字段命中）的日期和列与参照实际
+        比较，记录完成比较的范围和等待范围；缺列的日期不能被确认一致。
+        """
+        plan = self._cross_validates.get(plan_id)
+        if plan is None:
+            return {"ok": False, "message": f"交叉校验方案 {plan_id} 不存在"}
+
+        audits = [
+            audit for audit in self._projection_audits.values()
+            if audit.settlement_group == settlement_group
+        ]
+        if not audits:
+            return {"ok": False,
+                    "message": f"结算核对 {settlement_group} 没有投影核对明细"}
+
+        ref_job = self._find_fusion_job_by_table(plan.reference_wide_table)
+        ref_records = ref_job.merged_records if ref_job else []
+        ref_by_key = {str(r.get(plan.join_key, "")): r for r in ref_records}
+
+        mismatches: list[dict[str, Any]] = []
+        completed_scope: list[dict[str, Any]] = []
+        waiting_scope: list[dict[str, Any]] = []
+        compared_keys = 0
+
+        for audit in sorted(audits, key=lambda a: a.partition_range):
+            if audit.missing_fields:
+                audit.compared = False
+                waiting_scope.append({
+                    "partition_range": audit.partition_range,
+                    "missing_fields": list(audit.missing_fields),
+                })
+                continue
+            snap = self._snapshots.get(audit.snapshot_id)
+            if snap is None:
+                continue
+            rows = self._partition_records(snap)
+            columns = [f for f in plan.validate_fields if f in audit.hit_fields]
+            for row in rows:
+                key = str(row.get(plan.join_key, ""))
+                ref = ref_by_key.get(key)
+                if ref is None:
+                    continue
+                compared_keys += 1
+                for field_name in columns:
+                    pv = row.get(field_name)
+                    rv = ref.get(field_name)
+                    if str(pv) != str(rv):
+                        mismatch: dict[str, Any] = {
+                            "partition_range": audit.partition_range,
+                            "key": key,
+                            "field": field_name,
+                            "primary_value": pv,
+                            "reference_value": rv,
+                        }
+                        difference = _numeric_difference(pv, rv)
+                        if difference is not None:
+                            mismatch["difference"] = difference
+                        mismatches.append(mismatch)
+            audit.compared = True
+            completed_scope.append({
+                "partition_range": audit.partition_range,
+                "fields": columns,
+            })
+
+        if mismatches:
+            plan.validate_status = "偏差告警"
+        elif waiting_scope:
+            plan.validate_status = "校验中"  # 缺列日期仍在等待，不能确认一致
+        else:
+            plan.validate_status = "一致"
+
+        plan.last_result = json.dumps({
+            "settlement_group": settlement_group,
+            "compared_keys": compared_keys,
+            "mismatch_count": len(mismatches),
+            "completed_scope": completed_scope,
+            "waiting_scope": waiting_scope,
+        }, ensure_ascii=False)
+
+        return {
+            "ok": True,
+            "plan_code": plan.plan_code,
+            "settlement_group": settlement_group,
+            "validate_status": plan.validate_status,
+            "compared_keys": compared_keys,
+            "mismatch_count": len(mismatches),
+            "mismatches": mismatches[:20],
+            "completed_scope": completed_scope,
+            "waiting_scope": waiting_scope,
+            "can_confirm_consistent": not mismatches and not waiting_scope,
+        }
+
+    def register_day_pre_check(self, settlement_group: str,
+                               partition_range: str) -> dict[str, Any]:
+        """单日结果登记为预核：下一班可据此关闭该日期的补采待办。"""
+        audit = self._find_audit(settlement_group, partition_range)
+        if audit is None:
+            return {"ok": False,
+                    "message": f"{settlement_group} 没有分区 {partition_range} 的投影核对明细"}
+        if audit.missing_fields:
+            return {"ok": False,
+                    "message": f"分区 {partition_range} 字段缺失"
+                               f"（{'、'.join(audit.missing_fields)}），不能登记预核"}
+        audit.review_status = "预核"
+        return {
+            "ok": True,
+            "partition_range": partition_range,
+            "review_status": audit.review_status,
+            "message": f"分区 {partition_range} 已登记预核",
+        }
+
+    def complete_day_review(self, settlement_group: str,
+                            partition_range: str) -> dict[str, Any]:
+        """完成单日复核：需先登记预核，且本次交叉校验已覆盖该日期。"""
+        audit = self._find_audit(settlement_group, partition_range)
+        if audit is None:
+            return {"ok": False,
+                    "message": f"{settlement_group} 没有分区 {partition_range} 的投影核对明细"}
+        if audit.missing_fields:
+            return {"ok": False,
+                    "message": f"分区 {partition_range} 字段缺失，不能完成复核"}
+        if audit.review_status == "待复核":
+            return {"ok": False,
+                    "message": f"分区 {partition_range} 尚未登记预核"}
+        if not audit.compared:
+            return {"ok": False,
+                    "message": f"分区 {partition_range} 尚未完成交叉校验比较"}
+        audit.review_status = "已复核"
+        return {
+            "ok": True,
+            "partition_range": partition_range,
+            "review_status": audit.review_status,
+            "message": f"分区 {partition_range} 已完成复核",
+        }
+
+    def close_backfill_todo(self, settlement_group: str,
+                            partition_range: str) -> dict[str, Any]:
+        """关闭该日期的补采待办：需单日结果已登记预核。"""
+        state = self._settlement_groups.get(settlement_group)
+        if state is None or partition_range not in state["todos"]:
+            return {"ok": False,
+                    "message": f"{settlement_group} 没有分区 {partition_range} 的补采待办"}
+        audit = self._find_audit(settlement_group, partition_range)
+        if audit is None or audit.review_status not in ("预核", "已复核"):
+            return {"ok": False,
+                    "message": f"分区 {partition_range} 尚未登记预核，补采待办不能关闭"}
+        state["todos"][partition_range] = "办结"
+        return {
+            "ok": True,
+            "partition_range": partition_range,
+            "todo_status": "办结",
+            "message": f"分区 {partition_range} 的补采待办已办结",
+        }
+
+    def settlement_posting_status(self, settlement_group: str) -> dict[str, Any]:
+        """核对本次联合请求各日期办结/等待状态，以及本次仍未入账的原因。"""
+        state = self._settlement_groups.get(settlement_group)
+        audits = [
+            audit for audit in self._projection_audits.values()
+            if audit.settlement_group == settlement_group
+        ]
+        if state is None and not audits:
+            return {"ok": False, "message": f"结算核对 {settlement_group} 不存在"}
+
+        todos = state["todos"] if state else {}
+        dates: list[dict[str, Any]] = []
+        blockers: list[str] = []
+        for audit in sorted(audits, key=lambda a: a.partition_range):
+            dates.append({
+                "partition_range": audit.partition_range,
+                "projection_status": audit.status,
+                "missing_fields": list(audit.missing_fields),
+                "review_status": audit.review_status,
+                "todo_status": todos.get(audit.partition_range, "待办"),
+                "compared": audit.compared,
+            })
+            if audit.review_status != "已复核":
+                if audit.missing_fields:
+                    blockers.append(
+                        f"分区 {audit.partition_range} 字段缺失"
+                        f"（{'、'.join(audit.missing_fields)}），未完成复核"
+                    )
+                elif not audit.compared:
+                    blockers.append(
+                        f"分区 {audit.partition_range} 尚未完成交叉校验比较"
+                    )
+                else:
+                    blockers.append(
+                        f"分区 {audit.partition_range} 复核未完成（当前：{audit.review_status}）"
+                    )
+
+        return {
+            "ok": True,
+            "settlement_group": settlement_group,
+            "dates": dates,
+            "closed_dates": [d["partition_range"] for d in dates
+                             if d["todo_status"] == "办结"],
+            "waiting_dates": [d["partition_range"] for d in dates
+                              if d["todo_status"] != "办结"],
+            "can_post": bool(dates) and not blockers,
+            "post_blockers": blockers,
+            "posted": bool(state and state["posted"]),
+        }
+
+    def hand_to_settlement(self, settlement_group: str) -> dict[str, Any]:
+        """两个日期均完成复核后，交给结算员入账。"""
+        status = self.settlement_posting_status(settlement_group)
+        if not status.get("ok"):
+            return status
+        if status["posted"]:
+            return {"ok": False,
+                    "message": f"结算核对 {settlement_group} 已入账，请勿重复交账"}
+        if not status["can_post"]:
+            return {
+                "ok": False,
+                "message": "；".join(status["post_blockers"]) or "复核未完成，暂不能入账",
+                "post_blockers": status["post_blockers"],
+            }
+        state = self._settlement_groups.setdefault(
+            settlement_group, {"todos": {}, "posted": False},
+        )
+        state["posted"] = True
+        return {
+            "ok": True,
+            "settlement_group": settlement_group,
+            "posted": True,
+            "message": "已交给结算员入账",
+        }
+
+    def projection_audits(self, settlement_group: str | None = None) -> list[ProjectionAudit]:
+        """投影核对明细清单：可按结算核对组过滤。"""
+        audits = list(self._projection_audits.values())
+        if settlement_group is not None:
+            audits = [a for a in audits if a.settlement_group == settlement_group]
+        return sorted(audits, key=lambda a: (a.partition_range, a.audit_id))
 
     def execute_cross_validation(self, plan_id: int) -> dict[str, Any]:
         """执行跨宽表交叉校验，检测数据一致性偏差。"""
@@ -745,6 +1168,54 @@ class FusionEngine:
 
     # ---- 辅助方法 ----
 
+    def _partition_records(self, snap: SnapshotPartition) -> list[dict[str, Any]]:
+        """分区实际交付的记录：优先交付数据，否则回退到融合作业输出。"""
+        if snap.columns or snap.rows:
+            return list(snap.rows)
+        job = self._find_fusion_job_by_table(snap.target_wide_table)
+        return list(job.merged_records) if job else []
+
+    def _partition_columns(self, snap: SnapshotPartition,
+                           records: list[dict[str, Any]]) -> list[str]:
+        """分区实际列定义：交付列优先，否则从记录键推导（排除内部键）。"""
+        if snap.columns:
+            return list(snap.columns)
+        columns: list[str] = []
+        for rec in records:
+            for key in rec:
+                if key.startswith("_"):
+                    continue
+                if key not in columns:
+                    columns.append(key)
+        return columns
+
+    def _ensure_settlement_todo(self, settlement_group: str,
+                                partition_range: str) -> None:
+        """联合请求每覆盖一个日期，就登记一条补采待办。"""
+        state = self._settlement_groups.setdefault(
+            settlement_group, {"todos": {}, "posted": False},
+        )
+        state["todos"].setdefault(partition_range, "待办")
+
+    def _drop_stale_audits(self, settlement_group: str,
+                           partition_range: str) -> None:
+        """同一结算核对组内重跑同一日期时，旧的投影核对明细作废。"""
+        stale = [
+            audit_id for audit_id, audit in self._projection_audits.items()
+            if audit.settlement_group == settlement_group
+            and audit.partition_range == partition_range
+        ]
+        for audit_id in stale:
+            del self._projection_audits[audit_id]
+
+    def _find_audit(self, settlement_group: str,
+                    partition_range: str) -> ProjectionAudit | None:
+        for audit in self._projection_audits.values():
+            if (audit.settlement_group == settlement_group
+                    and audit.partition_range == partition_range):
+                return audit
+        return None
+
     def _find_source_by_code(self, source_code: str) -> SourceDef | None:
         for source in self._sources.values():
             if source.source_code == source_code:
@@ -874,6 +1345,8 @@ class FusionEngine:
             "cross_validates": len(self._cross_validates),
             "drifts": len(self._drifts),
             "monitors": len(self._monitors),
+            "projection_audits": len(self._projection_audits),
+            "settlement_groups": len(self._settlement_groups),
         }
 
 
